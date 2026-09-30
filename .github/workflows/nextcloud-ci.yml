@@ -1,0 +1,73 @@
+name: Group C Nextcloud CI and delivery
+# Target: https://github.com/RomeoCortez/4233-5233-GroupC
+# Put this file at the repository root: .github/workflows/nextcloud-ci.yml
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: nextcloud-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Generate disposable credentials and local TLS certificate
+        run: bash scripts/setup.sh
+      - name: Validate configuration and shell syntax
+        run: |
+          docker compose config -q
+          for script in scripts/*.sh; do bash -n "$script"; done
+          docker run --rm -v "$PWD/docker:/config:ro" --entrypoint php nextcloud:32-apache -l /config/custom.config.php
+          docker run --rm --add-host app1:127.0.0.1 --add-host app2:127.0.0.1 -v "$PWD/nginx/default.conf:/etc/nginx/conf.d/default.conf:ro" nginx:stable-alpine nginx -t
+          docker run --rm --add-host lb:127.0.0.1 -v "$PWD/apache/httpd.conf:/usr/local/apache2/conf/httpd.conf:ro" -v "$PWD/certs:/certs:ro" httpd:2.4-alpine httpd -t
+      - name: Build custom application image
+        run: docker build -f docker/Dockerfile -t nextcloud-group-c:ci .
+      - name: Start architecture in installation order
+        run: bash scripts/start.sh
+      - name: Test deployment integration and backup recovery
+        run: bash scripts/test.sh
+      - name: Save the exact tested image for delivery
+        run: docker save nextcloud-group-c:ci | gzip > nextcloud-tested-image.tar.gz
+      - name: Upload tested image
+        uses: actions/upload-artifact@v4
+        with:
+          name: nextcloud-tested-image
+          path: nextcloud-tested-image.tar.gz
+          retention-days: 3
+      - name: Show diagnostics on failure
+        if: failure()
+        run: docker compose ps -a && docker compose logs --tail=150
+      - name: Remove temporary containers and volumes
+        if: always()
+        run: docker compose down -v --remove-orphans
+  publish:
+    needs: build-test
+    # Delivery only after successful tests on a push to main.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: nextcloud-tested-image
+      - name: Load the tested image (do not rebuild)
+        run: gunzip -c nextcloud-tested-image.tar.gz | docker load
+      - name: Sign in to GitHub Container Registry
+        env:
+          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: printf '%s' "$REGISTRY_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+      - name: Publish image tagged with the commit SHA
+        run: |
+          image="ghcr.io/${GITHUB_REPOSITORY,,}/nextcloud:${GITHUB_SHA}"
+          docker tag nextcloud-group-c:ci "$image"
+          docker push "$image"
+          echo "Published $image" >> "$GITHUB_STEP_SUMMARY"

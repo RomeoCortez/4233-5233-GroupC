@@ -1,0 +1,6 @@
+# Never commit generated test credentials, certificates, or database contents.
+.env
+certs/
+*.tar.gz
+*.dump
+.DS_Store
